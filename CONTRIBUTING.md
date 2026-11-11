@@ -32,11 +32,6 @@ bun run daemon:logs
 > (see `InstallKind` in `src/utils/install-diagnostics.ts`), so don't "convert"
 > those to bun.
 
-## PR preview packages
-
-See [PR 预览包](docs/development/package-previews.md) for pkg.pr.new setup,
-installation commands, supported platforms, and the Actions smoke evidence.
-
 ## Midscene Test · Feishu browser E2E
 
 The existing Feishu browser scenarios in `test/e2e-browser/` run through
