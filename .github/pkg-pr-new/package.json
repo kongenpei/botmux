@@ -1,0 +1,7 @@
+{
+  "name": "botmux-preview-publisher",
+  "private": true,
+  "dependencies": {
+    "pkg-pr-new": "0.0.93"
+  }
+}

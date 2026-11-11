@@ -1,0 +1,199 @@
+name: Package Preview
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: package-preview-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  binaries:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux-x64
+          - os: ubuntu-24.04-arm
+            platform: linux-arm64
+          - os: ubuntu-latest
+            platform: linux-x64-musl
+          - os: ubuntu-24.04-arm
+            platform: linux-arm64-musl
+          - os: macos-15
+            platform: darwin
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      PREVIEW_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      PLATFORM: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Preview version
+        run: echo "PREVIEW_VERSION=0.0.0-preview-${PREVIEW_SHA:0:7}" >> "$GITHUB_ENV"
+
+      # Reuse the release builder: native node-pty must retain the glibc 2.28 floor.
+      - name: Build and smoke glibc binary
+        if: startsWith(matrix.platform, 'linux-') && !endsWith(matrix.platform, '-musl')
+        run: scripts/build-linux-glibc-baseline.sh "bun-$PLATFORM" "dist-bin/botmux-$PLATFORM" "$PREVIEW_VERSION"
+
+      - name: Build and smoke musl binary
+        if: endsWith(matrix.platform, '-musl')
+        run: |
+          docker run --rm -v "$PWD:/work" -w /work \
+            -e PLATFORM -e PREVIEW_VERSION \
+            -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+            node:22-alpine sh -euc '
+              apk add --no-cache python3 make g++ libstdc++ binutils >/dev/null
+              npm install -g bun@1.4.3 --loglevel=error
+              npm_config_build_from_source=true bun install --frozen-lockfile
+              native=node_modules/node-pty/build/Release/pty.node
+              test -f "$native"
+              readelf -d "$native" | grep -q "libc\.musl"
+              npm version "$PREVIEW_VERSION" --no-git-tag-version --allow-same-version
+              bun run build
+              bun scripts/build-bun-binary.mjs --target "bun-$PLATFORM" --out "dist-bin/botmux-$PLATFORM"
+              node scripts/smoke-bun-binary.mjs "dist-bin/botmux-$PLATFORM"
+              chown -R "$HOST_UID:$HOST_GID" dist-bin
+            '
+
+      - uses: actions/setup-node@v6
+        if: matrix.platform == 'darwin'
+        with:
+          node-version: 22
+      - uses: oven-sh/setup-bun@v2
+        if: matrix.platform == 'darwin'
+        with:
+          bun-version: 1.4.3
+      - name: Build and smoke macOS binaries
+        if: matrix.platform == 'darwin'
+        run: |
+          bun install --frozen-lockfile
+          npm version "$PREVIEW_VERSION" --no-git-tag-version --allow-same-version
+          bun run build
+          for arch in x64 arm64; do
+            binary="dist-bin/botmux-darwin-$arch"
+            bun scripts/build-bun-binary.mjs --target "bun-darwin-$arch" --out "$binary"
+            expected="$arch"
+            [ "$arch" != x64 ] || expected=x86_64
+            test "$(lipo -archs "$binary" | tr -d '[:space:]')" = "$expected"
+            codesign --verify --strict --verbose=2 "$binary"
+            grep -aq SkBitmap "$binary"
+          done
+          node scripts/smoke-bun-binary.mjs "dist-bin/botmux-darwin-$(node -p process.arch)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: preview-binaries-${{ matrix.platform }}
+          path: |
+            dist-bin/botmux-*
+            !dist-bin/*.map
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: binaries
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PREVIEW_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: preview-binaries-*
+          merge-multiple: true
+          path: dist-bin
+      - name: Install locked preview publisher
+        run: npm ci --prefix .github/pkg-pr-new --ignore-scripts --no-audit --no-fund
+      - name: Stage the main package and all six platform packages
+        # Keep the source manifests/lockfile untouched. Like release.yml, the
+        # installed main package needs only the binaries, not its build dependencies.
+        run: |
+          node --input-type=module <<'NODE'
+          import { chmodSync, copyFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+          import { dirname, join } from 'node:path';
+          const read = path => JSON.parse(readFileSync(path, 'utf8'));
+          const write = (path, value) => writeFileSync(path, JSON.stringify(value, null, 2) + '\n');
+          const version = `0.0.0-preview-${process.env.PREVIEW_SHA.slice(0, 7)}`;
+          const main = read('package.json');
+          const dest = '.preview/botmux';
+          mkdirSync(dest, { recursive: true });
+          for (const file of main.files) {
+            const target = join(dest, file);
+            mkdirSync(dirname(target), { recursive: true });
+            copyFileSync(file, target);
+          }
+          main.version = version;
+          delete main.dependencies;
+          delete main.devDependencies;
+          delete main.trustedDependencies;
+          main.scripts = { postinstall: main.scripts.postinstall };
+          main.optionalDependencies = {};
+          for (const platform of ['linux-x64', 'linux-arm64', 'linux-x64-musl', 'linux-arm64-musl', 'darwin-x64', 'darwin-arm64']) {
+            const pkg = read(`packages/binary-${platform}/package.json`);
+            const dir = `.preview/${pkg.name}`;
+            mkdirSync(dir, { recursive: true });
+            copyFileSync(`dist-bin/botmux-${platform}`, `${dir}/botmux`);
+            chmodSync(`${dir}/botmux`, 0o755);
+            pkg.version = version;
+            write(`${dir}/package.json`, pkg);
+            main.optionalDependencies[pkg.name] = version;
+          }
+          chmodSync(`${dest}/scripts/botmux-launcher.sh`, 0o755);
+          write(`${dest}/package.json`, main);
+          NODE
+      - name: Publish all packages in one call
+        id: publish
+        # Long URLs keep forks independent of the npm package's upstream repository.
+        # Directory inputs let pkg-pr-new rewrite optional deps to the SAME commit.
+        run: .github/pkg-pr-new/node_modules/.bin/pkg-pr-new publish --no-compact --bin --commentWithSha --no-template --json preview.json './.preview/*'
+      - name: Install the published preview and smoke the CLI
+        run: |
+          preview_url="$(node --input-type=module -e "import fs from 'node:fs'; console.log(JSON.parse(fs.readFileSync('preview.json')).packages.find(p => p.name === 'botmux').url)")"
+          export PREVIEW_VERSION="0.0.0-preview-${PREVIEW_SHA:0:7}"
+          sandbox="$(mktemp -d)"
+          # Isolated HOME/prefix prevents postinstall from replacing a live install.
+          HOME="$sandbox/home" npm install --global --prefix "$sandbox/prefix" "$preview_url" --no-audit --no-fund
+          HOME="$sandbox/home" "$sandbox/prefix/bin/botmux" --version | tee preview-version.txt
+          grep -F "$PREVIEW_VERSION" preview-version.txt
+          HOME="$sandbox/home" "$sandbox/prefix/bin/botmux" capabilities --json > preview-capabilities.json
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import fs from 'node:fs';
+          const capabilities = JSON.parse(fs.readFileSync('preview-capabilities.json', 'utf8'));
+          assert.ok(capabilities && typeof capabilities === 'object');
+          NODE
+          {
+            echo "### Installable botmux preview"
+            echo "$preview_url"
+            echo ""
+            echo "npm global install, --version and capabilities --json passed on Linux x64."
+            cat preview-version.txt
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: preview-evidence
+          path: |
+            preview.json
+            preview-version.txt
+            preview-capabilities.json
+          if-no-files-found: ignore
+          retention-days: 7
