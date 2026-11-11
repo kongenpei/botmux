@@ -46,6 +46,27 @@ jobs:
       - run: bun run build
       - run: bun run workflow-core:test
 
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cli-dist
+          path: dist/
+          include-hidden-files: true
+          if-no-files-found: error
+
+  preview:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - uses: actions/download-artifact@v8
+        with:
+          name: cli-dist
+          path: dist/
+
       - name: Publish CLI preview
         # Publish the existing Node build for Linux/macOS. Adapt only the CI
         # manifest: the release manifest installs a separate Bun binary.
